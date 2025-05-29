@@ -10,6 +10,7 @@ import com.qualcomm.robotcore.util.ElapsedTime;
 import org.firstinspires.ftc.robotcore.external.Telemetry;
 import com.pedropathing.follower.Follower;
 import com.pedropathing.pathgen.BezierCurve;
+import com.pedropathing.pathgen.BezierLine;
 import com.pedropathing.pathgen.Path;
 import com.pedropathing.pathgen.Point;
 
@@ -71,7 +72,22 @@ public class AutoPIDTunerGA extends OpMode {
     private int currentGeneration;
     private int currentIndividualIndex;
 
+    // Error tracking variables
+    private double totalTranslationalError;
+    private double totalHeadingError;
+    private double totalDriveError;
+    private int errorSampleCount;
+
+    // Overshoot tracking variables
+    private double maxOvershoot;
+    private boolean hasPassedTarget;
+    private double targetDistance;
+    private double lastDistance;
+
     private Path testPath; // The path used to evaluate each PID set
+    private Path reversePath; // The backward path
+    private boolean isForwardPath; // Track whether we're on forward or backward path
+    private boolean pathCompleted; // Track if both paths are completed
 
     /**
      * Represents a single set of PID parameters (a "chromosome") and its fitness.
@@ -136,8 +152,9 @@ public class AutoPIDTunerGA extends OpMode {
         telemetryA = new MultipleTelemetry(this.telemetry, FtcDashboard.getInstance().getTelemetry());
         follower = new Follower(hardwareMap, AConstants.class, LConstants.class);
 
-        // Define the test path for evaluating individuals (a simple straight line)
-        testPath = new Path(new BezierCurve(new Point(0, 0, Point.CARTESIAN), new Point(TEST_DISTANCE, 0, Point.CARTESIAN)));
+        // Define the test path for evaluating individuals (a simple straight line, no heading change)
+        testPath = new Path(new BezierLine(new Point(0, 0, Point.CARTESIAN), new Point(TEST_DISTANCE, 0, Point.CARTESIAN)));
+        reversePath = new Path(new BezierLine(new Point(TEST_DISTANCE, 0, Point.CARTESIAN), new Point(0, 0, Point.CARTESIAN)));
 
         telemetryA.addLine("GA PID Auto Tuner Initialized.");
         telemetryA.addLine("Ensure robot has clear space for " + TEST_DISTANCE + " inches.");
@@ -150,6 +167,8 @@ public class AutoPIDTunerGA extends OpMode {
         bestIndividualEver = null;
         currentState = TuningState.EVALUATING_INDIVIDUAL; // Start evaluation immediately
         runtime.reset();
+        isForwardPath = true;
+        pathCompleted = false;
     }
 
     /**
@@ -176,40 +195,92 @@ public class AutoPIDTunerGA extends OpMode {
                     applyPIDToAConstants(currentIndividual);
 
                     // Command the robot to follow the test path
-                    // This assumes follower.isBusy() will become true and then false when path completes
                     if (!follower.isBusy()) {
-                        // If follower just finished a path, calculate fitness for the previous individual
-                        if (currentIndividualIndex > 0) { // Don't calculate for the very first individual before it runs
-                            Individual evaluatedIndividual = population.get(currentIndividualIndex - 1);
-                            evaluatedIndividual.fitness = calculateFitness(evaluatedIndividual); // THIS IS THE CRITICAL CALL
-                            updateBestIndividual(evaluatedIndividual);
+                        if (!pathCompleted) {
+                            if (isForwardPath) {
+                                // Start forward path (straight, no heading change)
+                                follower.followPath(testPath);
+                                isForwardPath = false;
+                                telemetryA.addLine("Starting forward path...");
+                            } else {
+                                // Start backward path (straight, no heading change)
+                                follower.followPath(reversePath);
+                                pathCompleted = true;
+                                telemetryA.addLine("Starting backward path...");
+                            }
+                            runtime.reset();
+                        } else {
+                            // Both paths completed, calculate fitness for the current individual
+                            currentIndividual.fitness = calculateFitness(currentIndividual);
+                            updateBestIndividual(currentIndividual);
+
+                            // Reset for next individual
+                            totalTranslationalError = 0;
+                            totalHeadingError = 0;
+                            totalDriveError = 0;
+                            errorSampleCount = 0;
+                            maxOvershoot = 0;
+                            hasPassedTarget = false;
+                            targetDistance = TEST_DISTANCE;
+                            lastDistance = 0;
+                            isForwardPath = true;
+                            pathCompleted = false;
+
+                            // Move to next individual
+                            currentIndividualIndex++;
+
+                            // If there are more individuals to evaluate, start the next one
+                            if (currentIndividualIndex < population.size()) {
+                                Individual nextIndividual = population.get(currentIndividualIndex);
+                                applyPIDToAConstants(nextIndividual);
+                                follower.followPath(testPath);
+                                runtime.reset();
+                                telemetryA.addData("Evaluating Individual", (currentIndividualIndex + 1) + "/" + population.size());
+                                telemetryA.addData("Current PID Set", nextIndividual.toString());
+                            }
                         }
-                        // Now start the next individual's run
-                        follower.followPath(testPath);
-                        runtime.reset(); // Reset runtime to track individual's run time
-                        telemetryA.addData("Evaluating Individual", (currentIndividualIndex + 1) + "/" + population.size());
-                        telemetryA.addData("Current PID Set", currentIndividual.toString());
-                        currentIndividualIndex++; // Move to the next individual
                     } else {
-                        // Robot is currently running the path, just wait
+                        // Robot is currently running the path, accumulate error metrics
+                        totalTranslationalError += follower.getTranslationalError().getMagnitude();
+                        totalHeadingError += Math.abs(follower.getHeadingError());
+                        totalDriveError += Math.abs(follower.getDriveVelocityError());
+                        errorSampleCount++;
+
+                        // Calculate and display current averages
+                        double avgTranslationalError = totalTranslationalError / errorSampleCount;
+                        double avgHeadingError = totalHeadingError / errorSampleCount;
+                        double avgDriveError = totalDriveError / errorSampleCount;
+
+                        // Calculate current distance from start
+                        double currentDistance = follower.getPose().getX();
+
+                        // Check for overshoot (only during forward path)
+                        if (isForwardPath) {
+                            if (!hasPassedTarget && currentDistance >= targetDistance) {
+                                hasPassedTarget = true;
+                            }
+
+                            if (hasPassedTarget) {
+                                double overshoot = currentDistance - targetDistance;
+                                maxOvershoot = Math.max(maxOvershoot, overshoot);
+                            }
+                        }
+
+                        telemetryA.addData("Path", isForwardPath ? "Forward" : "Backward");
+                        telemetryA.addData("Avg Translational Error", "%.4f", avgTranslationalError);
+                        telemetryA.addData("Avg Heading Error", "%.4f", avgHeadingError);
+                        telemetryA.addData("Avg Drive Error", "%.4f", avgDriveError);
+                        telemetryA.addData("Max Overshoot", "%.4f", maxOvershoot);
                         telemetryA.addData("Running Path", "Time: %.2f s", runtime.seconds());
+
+                        lastDistance = currentDistance;
                     }
                 } else {
                     // All individuals in the current generation have been evaluated
-                    // Calculate fitness for the very last individual after its path completes
-                    if (!follower.isBusy() && currentIndividualIndex == population.size()) {
-                        Individual lastIndividual = population.get(population.size() - 1);
-                        lastIndividual.fitness = calculateFitness(lastIndividual);
-                        updateBestIndividual(lastIndividual);
-                        currentIndividualIndex++; // Increment to mark all evaluated
-                    }
-
-                    if (currentIndividualIndex > population.size()) { // All evaluated and last fitness calculated
-                        currentState = TuningState.EVOLVING_POPULATION;
-                        telemetryA.addLine("Generation " + currentGeneration + " evaluation complete.");
-                        telemetryA.addData("Best Fitness This Gen", getBestFitnessInCurrentGeneration());
-                        telemetryA.addData("Overall Best", bestIndividualEver.toString());
-                    }
+                    currentState = TuningState.EVOLVING_POPULATION;
+                    telemetryA.addLine("Generation " + currentGeneration + " evaluation complete.");
+                    telemetryA.addData("Best Fitness This Gen", getBestFitnessInCurrentGeneration());
+                    telemetryA.addData("Overall Best", bestIndividualEver.toString());
                 }
                 break;
 
@@ -275,33 +346,37 @@ public class AutoPIDTunerGA extends OpMode {
      * @return The calculated fitness score.
      */
     private double calculateFitness(Individual individual) {
-        // --- YOUR IMPLEMENTATION HERE ---
-        // This is a conceptual placeholder.
-        // You would need to access follower's performance data or your own sensor data.
+        // Calculate average errors
+        double avgTranslationalError = totalTranslationalError / errorSampleCount;
+        double avgHeadingError = totalHeadingError / errorSampleCount;
+        double avgDriveError = totalDriveError / errorSampleCount;
 
-        // Example conceptual metrics:
-        // double avgTranslationalError = follower.getAverageTranslationalError(); // You'd need to track this
-        // double maxOvershoot = follower.getMaxOvershoot(); // You'd need to track this
-        // double pathCompletionTime = runtime.seconds(); // Time taken for the current path run
-        // double avgHeadingError = follower.getAverageHeadingError(); // You'd need to track this
+        // Calculate time penalty
+        double timePenalty = runtime.seconds() * 0.1;
 
-        // A simple example fitness function (lower is better):
-        // This is highly simplified and for demonstration only.
-        // You would need to weight these based on what's important for your robot.
-        // For example, if minimizing overshoot is critical, give it a higher weight.
-        double conceptualError = follower.getTranslationalError().getMagnitude() + Math.abs(follower.getHeadingError()) + Math.abs(follower.getDriveVelocityError());
-        double conceptualOvershoot = 0; // Placeholder, you'd calculate this from actual path data
-        double conceptualTimePenalty = runtime.seconds() * 0.1; // Penalize longer times
+        // Calculate overshoot penalty (heavily weighted since overshoot is critical)
+        double overshootPenalty = maxOvershoot * 100.0;
 
-        // This is a dummy fitness function for compilation and demonstration.
-        // Replace with actual performance metrics from your robot.
-        double fitness = conceptualError * 100 + conceptualOvershoot * 50 + conceptualTimePenalty;
+        // Combine all factors into final fitness score
+        // Weights can be adjusted based on what's most important for your robot
+        double fitness = (avgTranslationalError * 150.0) +
+                (avgHeadingError * 50.0) +
+                (avgDriveError * 30.0) +
+                timePenalty +
+                overshootPenalty;
 
-        // Add a small random component to simulate real-world variability and prevent
-        // all individuals from having identical fitness if performance is perfect.
+        // Add a small random component to prevent identical fitness scores
         fitness += random.nextDouble() * 0.01;
 
-        telemetryA.addData("Calculated Fitness", fitness);
+        telemetryA.addData("Fitness Components",
+                "Trans: %.2f, Head: %.2f, Drive: %.2f, Time: %.2f, Overshoot: %.2f",
+                avgTranslationalError * 100.0,
+                avgHeadingError * 50.0,
+                avgDriveError * 30.0,
+                timePenalty,
+                overshootPenalty
+        );
+
         return fitness;
     }
 
