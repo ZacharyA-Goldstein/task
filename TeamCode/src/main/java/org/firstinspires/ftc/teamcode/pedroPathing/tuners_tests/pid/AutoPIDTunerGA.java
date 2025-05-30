@@ -3,6 +3,8 @@ package org.firstinspires.ftc.teamcode.pedroPathing.tuners_tests.pid;
 import com.acmerobotics.dashboard.FtcDashboard;
 import com.acmerobotics.dashboard.config.Config;
 import com.acmerobotics.dashboard.telemetry.MultipleTelemetry;
+import com.pedropathing.util.CustomFilteredPIDFCoefficients;
+import com.pedropathing.util.CustomPIDFCoefficients;
 import com.qualcomm.robotcore.eventloop.opmode.Autonomous;
 import com.qualcomm.robotcore.eventloop.opmode.OpMode;
 import com.qualcomm.robotcore.util.ElapsedTime;
@@ -100,11 +102,21 @@ public class AutoPIDTunerGA extends OpMode {
         /**
          * Constructor for a new individual with random PID parameters.
          * There are 9 PID parameters in total (3 for translational, 3 for heading, 3 for drive).
+         * I and D values are more likely to be near zero.
          */
         public Individual() {
             pidParams = new double[9];
             for (int i = 0; i < pidParams.length; i++) {
-                pidParams[i] = random.nextDouble() * (PID_MAX_VALUE - PID_MIN_VALUE) + PID_MIN_VALUE;
+                // For P values (indices 0, 3, 6)
+                if (i % 3 == 0) {
+                    pidParams[i] = random.nextDouble() * (PID_MAX_VALUE - PID_MIN_VALUE) + PID_MIN_VALUE;
+                }
+                // For I and D values (indices 1,2,4,5,7,8)
+                else {
+                    // Use exponential distribution to favor smaller values
+                    double randomValue = -Math.log(random.nextDouble()) * 0.1; // 0.1 controls the spread
+                    pidParams[i] = Math.min(PID_MAX_VALUE, randomValue);
+                }
             }
             fitness = Double.POSITIVE_INFINITY; // Initialize with infinite fitness
         }
@@ -254,14 +266,23 @@ public class AutoPIDTunerGA extends OpMode {
                         // Calculate current distance from start
                         double currentDistance = follower.getPose().getX();
 
-                        // Check for overshoot (only during forward path)
+                        // Check for overshoot in both directions
                         if (isForwardPath) {
+                            // Forward path overshoot (past TEST_DISTANCE)
                             if (!hasPassedTarget && currentDistance >= targetDistance) {
                                 hasPassedTarget = true;
                             }
-
                             if (hasPassedTarget) {
                                 double overshoot = currentDistance - targetDistance;
+                                maxOvershoot = Math.max(maxOvershoot, overshoot);
+                            }
+                        } else {
+                            // Backward path overshoot (past 0)
+                            if (!hasPassedTarget && currentDistance <= 0) {
+                                hasPassedTarget = true;
+                            }
+                            if (hasPassedTarget) {
+                                double overshoot = Math.abs(currentDistance); // Distance past 0
                                 maxOvershoot = Math.max(maxOvershoot, overshoot);
                             }
                         }
@@ -355,11 +376,11 @@ public class AutoPIDTunerGA extends OpMode {
         double timePenalty = runtime.seconds() * 0.1;
 
         // Calculate overshoot penalty (heavily weighted since overshoot is critical)
-        double overshootPenalty = maxOvershoot * 100.0;
+        double overshootPenalty = maxOvershoot * 200.0;
 
         // Combine all factors into final fitness score
         // Weights can be adjusted based on what's most important for your robot
-        double fitness = (avgTranslationalError * 150.0) +
+        double fitness = (avgTranslationalError * 100.0) +
                 (avgHeadingError * 50.0) +
                 (avgDriveError * 30.0) +
                 timePenalty +
@@ -411,20 +432,35 @@ public class AutoPIDTunerGA extends OpMode {
      * @param individual The individual whose PID parameters should be applied.
      */
     private void applyPIDToAConstants(Individual individual) {
-        AConstants.P_TRANSLATIONAL = individual.pidParams[0];
-        AConstants.I_TRANSLATIONAL = individual.pidParams[1];
-        AConstants.D_TRANSLATIONAL = individual.pidParams[2];
+//        AConstants.P_TRANSLATIONAL = individual.pidParams[0];
+//        AConstants.I_TRANSLATIONAL = individual.pidParams[1];
+//        AConstants.D_TRANSLATIONAL = individual.pidParams[2];
+        follower.setTranslationalPIDF(new CustomPIDFCoefficients(
+                individual.pidParams[0],//P
+                individual.pidParams[1],//I
+                individual.pidParams[2],//D
+                0));
 
-        AConstants.P_HEADING = individual.pidParams[3];
-        AConstants.I_HEADING = individual.pidParams[4];
-        AConstants.D_HEADING = individual.pidParams[5];
+//        AConstants.P_HEADING = individual.pidParams[3];
+//        AConstants.I_HEADING = individual.pidParams[4];
+//        AConstants.D_HEADING = individual.pidParams[5];
+        follower.setHeadingPIDF(new CustomPIDFCoefficients(
+                individual.pidParams[3],//P
+                individual.pidParams[4],//I
+                individual.pidParams[5],//D
+                0));
 
         // Assuming AConstants has these for a generic "drive" PID.
         // If your system doesn't use these, you can remove them.
         // These might be used for individual motor PIDs or a master drive power scaling.
-        AConstants.P_DRIVE = individual.pidParams[6];
-        AConstants.I_DRIVE = individual.pidParams[7];
-        AConstants.D_DRIVE = individual.pidParams[8];
+//        AConstants.P_DRIVE = individual.pidParams[6];
+//        AConstants.I_DRIVE = individual.pidParams[7];
+//        AConstants.D_DRIVE = individual.pidParams[8];
+        follower.setDrivePIDF(new CustomFilteredPIDFCoefficients(
+                individual.pidParams[6],//P
+                individual.pidParams[7],//I
+                individual.pidParams[8],//D
+                0,0));
     }
 
     /**
@@ -506,6 +542,7 @@ public class AutoPIDTunerGA extends OpMode {
 
     /**
      * Mutates an individual's PID parameters with a given probability and strength.
+     * I and D values are more likely to mutate towards zero.
      * @param individual The individual to mutate.
      * @return A new mutated individual.
      */
@@ -513,8 +550,24 @@ public class AutoPIDTunerGA extends OpMode {
         double[] mutatedParams = individual.pidParams.clone();
         for (int i = 0; i < mutatedParams.length; i++) {
             if (random.nextDouble() < MUTATION_RATE) {
-                // Apply a random perturbation
-                mutatedParams[i] += (random.nextDouble() * 2 - 1) * MUTATION_STRENGTH; // Value between -strength and +strength
+                if (i % 3 == 0) { // P values
+                    // Regular mutation for P values
+                    mutatedParams[i] += (random.nextDouble() * 2 - 1) * MUTATION_STRENGTH;
+                } else { // I and D values
+                    // Bias mutation towards zero for I and D values
+                    double currentValue = mutatedParams[i];
+                    double mutation = (random.nextDouble() * 2 - 1) * MUTATION_STRENGTH * 0.5;
+                    // If current value is positive, more likely to decrease
+                    // If current value is negative, more likely to increase
+
+//                    if (currentValue > 0) {
+//                        mutation *= -Math.abs(currentValue) * 2; // Stronger bias towards zero
+//                    } else if (currentValue < 0) {
+//                        mutation *= Math.abs(currentValue) * 2; // Stronger bias towards zero
+//                    }
+
+                    mutatedParams[i] += mutation;
+                }
                 // Clamp the value within the defined PID range
                 mutatedParams[i] = Math.max(PID_MIN_VALUE, Math.min(PID_MAX_VALUE, mutatedParams[i]));
             }
